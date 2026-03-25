@@ -425,6 +425,43 @@ def get_keyword_pingers_for_channel(channel_id: int) -> List[tuple]:
         return []
 
 
+def get_keyword_pingers_for_user(user_id: int) -> List[tuple]:
+    try:
+        with closing(sqlite3.connect(QOGITA_DB_PATH)) as conn:
+            return conn.execute("""
+                SELECT keyword, channel_id, created_at
+                FROM keyword_pingers
+                WHERE user_id = ?
+                ORDER BY keyword ASC, channel_id ASC
+            """, (int(user_id),)).fetchall()
+    except Exception as e:
+        logger.error(f"Failed to load keyword pingers for user {user_id}: {e}")
+        return []
+
+
+def remove_keyword_pinger(user_id: int, keyword: str, channel_id: Optional[int] = None) -> int:
+    normalized = normalize_keyword(keyword)
+    if not normalized:
+        return 0
+    try:
+        with closing(sqlite3.connect(QOGITA_DB_PATH)) as conn:
+            if channel_id is None:
+                cursor = conn.execute("""
+                    DELETE FROM keyword_pingers
+                    WHERE user_id = ? AND keyword = ?
+                """, (int(user_id), normalized))
+            else:
+                cursor = conn.execute("""
+                    DELETE FROM keyword_pingers
+                    WHERE user_id = ? AND keyword = ? AND channel_id = ?
+                """, (int(user_id), normalized, int(channel_id)))
+            conn.commit()
+            return cursor.rowcount
+    except Exception as e:
+        logger.error(f"Failed to remove keyword pinger for user {user_id}: {e}")
+        return 0
+
+
 def _attrs_ok(q: Dict[str, str], k: Dict[str, str]) -> bool:
     q_size = q.get("size") or size_token(q.get("raw", ""))
     k_size = k.get("size") or size_token(k.get("raw", ""))
@@ -2760,6 +2797,67 @@ async def keyword_pinger(interaction: discord.Interaction, keyword: str):
         view=view,
         ephemeral=True
     )
+
+
+@keyword_group.command(name="list", description="See your saved keyword pingers.")
+async def keyword_list(interaction: discord.Interaction):
+    rows = get_keyword_pingers_for_user(interaction.user.id)
+    if not rows:
+        await interaction.response.send_message("You do not have any saved keyword pingers yet.", ephemeral=True)
+        return
+
+    grouped: Dict[str, List[int]] = {}
+    for keyword, channel_id, _created_at in rows:
+        grouped.setdefault(keyword, []).append(int(channel_id))
+
+    lines = []
+    for keyword, channel_ids in grouped.items():
+        channel_mentions = ", ".join(f"<#{cid}>" for cid in sorted(set(channel_ids)))
+        lines.append(f"• `{keyword}` → {channel_mentions}")
+
+    msg = "Your saved keyword pingers:\n" + "\n".join(lines)
+    await interaction.response.send_message(msg[:1900], ephemeral=True)
+
+
+@keyword_group.command(name="remove", description="Remove one of your saved keyword pingers.")
+@app_commands.describe(
+    keyword="Keyword to remove",
+    channel="Optional: remove only this channel for the keyword"
+)
+async def keyword_remove(interaction: discord.Interaction, keyword: str, channel: Optional[discord.TextChannel] = None):
+    normalized = normalize_keyword(keyword)
+    if not normalized:
+        await interaction.response.send_message("Please provide a valid keyword.", ephemeral=True)
+        return
+
+    deleted = remove_keyword_pinger(
+        interaction.user.id,
+        normalized,
+        channel_id=(channel.id if channel else None)
+    )
+    if deleted <= 0:
+        if channel:
+            await interaction.response.send_message(
+                f"No saved pinger found for `{normalized}` in {channel.mention}.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"No saved pingers found for keyword `{normalized}`.",
+                ephemeral=True
+            )
+        return
+
+    if channel:
+        await interaction.response.send_message(
+            f"Removed `{normalized}` from {channel.mention}. ({deleted} subscription removed)",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"Removed keyword `{normalized}` from all your saved channels. ({deleted} subscriptions removed)",
+            ephemeral=True
+        )
 
 
 client.tree.add_command(keyword_group, guild=discord.Object(id=GUILD_ID))
