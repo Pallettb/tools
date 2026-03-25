@@ -2728,12 +2728,44 @@ def collect_allowed_keyword_channels(guild: discord.Guild) -> Dict[int, discord.
     return allowed_channels
 
 
+def _keyword_channel_choices(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    if not interaction.guild:
+        return []
+    allowed_channels = collect_allowed_keyword_channels(interaction.guild)
+    if not allowed_channels:
+        return []
+
+    query = (current or "").strip().lower()
+    choices: List[app_commands.Choice[str]] = []
+    for channel in sorted(allowed_channels.values(), key=lambda c: c.name.lower()):
+        if query and query not in channel.name.lower():
+            continue
+        choices.append(app_commands.Choice(name=f"#{channel.name}", value=str(channel.id)))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+def _resolve_keyword_channel(guild: discord.Guild, channel_id_text: str) -> Optional[discord.TextChannel]:
+    try:
+        channel_id = int(channel_id_text)
+    except (TypeError, ValueError):
+        return None
+
+    allowed_channels = collect_allowed_keyword_channels(guild)
+    channel = allowed_channels.get(channel_id)
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    return None
+
+
 @keyword_group.command(name="pinger", description="Get DM alerts when your keyword appears.")
 @app_commands.describe(
     keyword="Word or phrase to watch for",
-    channel="Channel to monitor for this keyword"
+    channel="Start typing to pick one approved channel"
 )
-async def keyword_pinger(interaction: discord.Interaction, keyword: str, channel: discord.TextChannel):
+@app_commands.autocomplete(channel=_keyword_channel_choices)
+async def keyword_pinger(interaction: discord.Interaction, keyword: str, channel: str):
     normalized = normalize_keyword(keyword)
     if not normalized:
         await interaction.response.send_message("Please provide a valid keyword.", ephemeral=True)
@@ -2743,27 +2775,23 @@ async def keyword_pinger(interaction: discord.Interaction, keyword: str, channel
         await interaction.response.send_message("This command can only be used inside the server.", ephemeral=True)
         return
 
-    allowed_channels = collect_allowed_keyword_channels(interaction.guild)
-    if not allowed_channels:
-        await interaction.response.send_message("No allowed channels are currently available.", ephemeral=True)
-        return
-
-    if channel.id not in allowed_channels:
+    selected_channel = _resolve_keyword_channel(interaction.guild, channel)
+    if not selected_channel:
         await interaction.response.send_message(
-            "That channel is not allowed for keyword pingers. Choose one from the approved channels/categories.",
+            "Pick a channel from the approved autocomplete list only.",
             ephemeral=True
         )
         return
 
-    inserted = save_keyword_pinger(interaction.user.id, normalized, [channel.id])
+    inserted = save_keyword_pinger(interaction.user.id, normalized, [selected_channel.id])
     if inserted > 0:
         await interaction.response.send_message(
-            f"Saved keyword `{normalized}` for {channel.mention}.",
+            f"Saved keyword `{normalized}` for {selected_channel.mention}.",
             ephemeral=True
         )
     else:
         await interaction.response.send_message(
-            f"You already have keyword `{normalized}` saved for {channel.mention}.",
+            f"You already have keyword `{normalized}` saved for {selected_channel.mention}.",
             ephemeral=True
         )
 
@@ -2791,23 +2819,33 @@ async def keyword_list(interaction: discord.Interaction):
 @keyword_group.command(name="remove", description="Remove one of your saved keyword pingers.")
 @app_commands.describe(
     keyword="Keyword to remove",
-    channel="Optional: remove only this channel for the keyword"
+    channel="Optional: start typing to pick one approved channel"
 )
-async def keyword_remove(interaction: discord.Interaction, keyword: str, channel: Optional[discord.TextChannel] = None):
+@app_commands.autocomplete(channel=_keyword_channel_choices)
+async def keyword_remove(interaction: discord.Interaction, keyword: str, channel: Optional[str] = None):
     normalized = normalize_keyword(keyword)
     if not normalized:
         await interaction.response.send_message("Please provide a valid keyword.", ephemeral=True)
         return
 
-    deleted = remove_keyword_pinger(
-        interaction.user.id,
-        normalized,
-        channel_id=(channel.id if channel else None)
-    )
-    if deleted <= 0:
-        if channel:
+    selected_channel: Optional[discord.TextChannel] = None
+    if channel:
+        if not interaction.guild:
+            await interaction.response.send_message("This command can only be used inside the server.", ephemeral=True)
+            return
+        selected_channel = _resolve_keyword_channel(interaction.guild, channel)
+        if not selected_channel:
             await interaction.response.send_message(
-                f"No saved pinger found for `{normalized}` in {channel.mention}.",
+                "Pick a channel from the approved autocomplete list only.",
+                ephemeral=True
+            )
+            return
+
+    deleted = remove_keyword_pinger(interaction.user.id, normalized, channel_id=(selected_channel.id if selected_channel else None))
+    if deleted <= 0:
+        if selected_channel:
+            await interaction.response.send_message(
+                f"No saved pinger found for `{normalized}` in {selected_channel.mention}.",
                 ephemeral=True
             )
         else:
@@ -2817,9 +2855,9 @@ async def keyword_remove(interaction: discord.Interaction, keyword: str, channel
             )
         return
 
-    if channel:
+    if selected_channel:
         await interaction.response.send_message(
-            f"Removed `{normalized}` from {channel.mention}. ({deleted} subscription removed)",
+            f"Removed `{normalized}` from {selected_channel.mention}. ({deleted} subscription removed)",
             ephemeral=True
         )
     else:
@@ -2847,8 +2885,6 @@ async def process_keyword_pingers(message: discord.Message):
     matches_by_user: Dict[int, List[str]] = {}
     for user_id, keyword in subscriptions:
         if not keyword:
-            continue
-        if str(message.author.id) == str(user_id):
             continue
         if keyword in text:
             matches_by_user.setdefault(int(user_id), []).append(keyword)
