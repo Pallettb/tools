@@ -2728,7 +2728,7 @@ def collect_allowed_keyword_channels(guild: discord.Guild) -> Dict[int, discord.
     return allowed_channels
 
 
-def _keyword_channel_choices(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+async def _keyword_channel_choices(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     if not interaction.guild:
         return []
     allowed_channels = collect_allowed_keyword_channels(interaction.guild)
