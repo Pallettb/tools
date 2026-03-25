@@ -174,8 +174,18 @@ def init_db():
                     expiry INTEGER
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS keyword_pingers (
+                    user_id INTEGER NOT NULL,
+                    keyword TEXT NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(user_id, keyword, channel_id)
+                )
+            """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_search_last_seen ON search_cache(last_seen)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_variants_last_seen ON variants(last_seen)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_keyword_channel ON keyword_pingers(channel_id)")
             conn.commit()
     except Exception as e:
         logging.error(f"Failed to init SQLite DB: {e}")
@@ -332,6 +342,22 @@ def check_skipped_product(gtin):
 
 init_db()
 
+KEYWORD_ALLOWED_CHANNEL_IDS = {
+    1469846994641223784,
+    1469847414738387191,
+    1469847611451375780,
+    1265414863384084490,
+    1369779123949539458,
+    1418877365005582367,
+    1483178233095651539,
+}
+
+KEYWORD_ALLOWED_CATEGORY_IDS = {
+    1265415271586201834,
+    1428092841082486895,
+    1280219378809311334,
+}
+
 
 # --------------------------------------------------------------------------- #
 # helpers                                                                     #
@@ -357,6 +383,81 @@ def size_token(text: str) -> str:
 def variant_token(text: str) -> str:
     m = VARIANT_RE.search(text)
     return m.group(0).lower() if m else ""
+
+
+def normalize_keyword(keyword: str) -> str:
+    return " ".join((keyword or "").strip().lower().split())
+
+
+def save_keyword_pinger(user_id: int, keyword: str, channel_ids: List[int]) -> int:
+    keyword = normalize_keyword(keyword)
+    if not keyword or not channel_ids:
+        return 0
+
+    rows_written = 0
+    try:
+        with closing(sqlite3.connect(QOGITA_DB_PATH)) as conn:
+            for channel_id in channel_ids:
+                cursor = conn.execute("""
+                    INSERT INTO keyword_pingers (user_id, keyword, channel_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id, keyword, channel_id) DO NOTHING
+                """, (int(user_id), keyword, int(channel_id), now_epoch()))
+                rows_written += cursor.rowcount
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to save keyword pinger for user {user_id}: {e}")
+    return rows_written
+
+
+def get_keyword_pingers_for_channel(channel_id: int) -> List[tuple]:
+    try:
+        with closing(sqlite3.connect(QOGITA_DB_PATH)) as conn:
+            return conn.execute("""
+                SELECT user_id, keyword
+                FROM keyword_pingers
+                WHERE channel_id = ?
+            """, (int(channel_id),)).fetchall()
+    except Exception as e:
+        logger.error(f"Failed to load keyword pingers for channel {channel_id}: {e}")
+        return []
+
+
+def get_keyword_pingers_for_user(user_id: int) -> List[tuple]:
+    try:
+        with closing(sqlite3.connect(QOGITA_DB_PATH)) as conn:
+            return conn.execute("""
+                SELECT keyword, channel_id, created_at
+                FROM keyword_pingers
+                WHERE user_id = ?
+                ORDER BY keyword ASC, channel_id ASC
+            """, (int(user_id),)).fetchall()
+    except Exception as e:
+        logger.error(f"Failed to load keyword pingers for user {user_id}: {e}")
+        return []
+
+
+def remove_keyword_pinger(user_id: int, keyword: str, channel_id: Optional[int] = None) -> int:
+    normalized = normalize_keyword(keyword)
+    if not normalized:
+        return 0
+    try:
+        with closing(sqlite3.connect(QOGITA_DB_PATH)) as conn:
+            if channel_id is None:
+                cursor = conn.execute("""
+                    DELETE FROM keyword_pingers
+                    WHERE user_id = ? AND keyword = ?
+                """, (int(user_id), normalized))
+            else:
+                cursor = conn.execute("""
+                    DELETE FROM keyword_pingers
+                    WHERE user_id = ? AND keyword = ? AND channel_id = ?
+                """, (int(user_id), normalized, int(channel_id)))
+            conn.commit()
+            return cursor.rowcount
+    except Exception as e:
+        logger.error(f"Failed to remove keyword pinger for user {user_id}: {e}")
+        return 0
 
 
 def _attrs_ok(q: Dict[str, str], k: Dict[str, str]) -> bool:
@@ -2605,6 +2706,208 @@ async def qogita(interaction: discord.Interaction, brand: str, max_price: float 
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
+keyword_group = app_commands.Group(name="keyword", description="Keyword alert commands")
+
+
+def collect_allowed_keyword_channels(guild: discord.Guild) -> Dict[int, discord.abc.GuildChannel]:
+    allowed_channels: Dict[int, discord.abc.GuildChannel] = {}
+
+    for channel_id in KEYWORD_ALLOWED_CHANNEL_IDS:
+        channel = guild.get_channel(channel_id)
+        if channel and isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel, discord.ForumChannel)):
+            if isinstance(channel, discord.TextChannel):
+                allowed_channels[channel.id] = channel
+
+    for category_id in KEYWORD_ALLOWED_CATEGORY_IDS:
+        category = guild.get_channel(category_id)
+        if isinstance(category, discord.CategoryChannel):
+            for channel in category.channels:
+                if isinstance(channel, discord.TextChannel):
+                    allowed_channels[channel.id] = channel
+
+    return allowed_channels
+
+
+def _keyword_channel_choices(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    if not interaction.guild:
+        return []
+    allowed_channels = collect_allowed_keyword_channels(interaction.guild)
+    if not allowed_channels:
+        return []
+
+    query = (current or "").strip().lower()
+    choices: List[app_commands.Choice[str]] = []
+    for channel in sorted(allowed_channels.values(), key=lambda c: c.name.lower()):
+        if query and query not in channel.name.lower():
+            continue
+        choices.append(app_commands.Choice(name=f"#{channel.name}", value=str(channel.id)))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+def _resolve_keyword_channel(guild: discord.Guild, channel_id_text: str) -> Optional[discord.TextChannel]:
+    try:
+        channel_id = int(channel_id_text)
+    except (TypeError, ValueError):
+        return None
+
+    allowed_channels = collect_allowed_keyword_channels(guild)
+    channel = allowed_channels.get(channel_id)
+    if isinstance(channel, discord.TextChannel):
+        return channel
+    return None
+
+
+@keyword_group.command(name="pinger", description="Get DM alerts when your keyword appears.")
+@app_commands.describe(
+    keyword="Word or phrase to watch for",
+    channel="Start typing to pick one approved channel"
+)
+@app_commands.autocomplete(channel=_keyword_channel_choices)
+async def keyword_pinger(interaction: discord.Interaction, keyword: str, channel: str):
+    normalized = normalize_keyword(keyword)
+    if not normalized:
+        await interaction.response.send_message("Please provide a valid keyword.", ephemeral=True)
+        return
+
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used inside the server.", ephemeral=True)
+        return
+
+    selected_channel = _resolve_keyword_channel(interaction.guild, channel)
+    if not selected_channel:
+        await interaction.response.send_message(
+            "Pick a channel from the approved autocomplete list only.",
+            ephemeral=True
+        )
+        return
+
+    inserted = save_keyword_pinger(interaction.user.id, normalized, [selected_channel.id])
+    if inserted > 0:
+        await interaction.response.send_message(
+            f"Saved keyword `{normalized}` for {selected_channel.mention}.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"You already have keyword `{normalized}` saved for {selected_channel.mention}.",
+            ephemeral=True
+        )
+
+
+@keyword_group.command(name="list", description="See your saved keyword pingers.")
+async def keyword_list(interaction: discord.Interaction):
+    rows = get_keyword_pingers_for_user(interaction.user.id)
+    if not rows:
+        await interaction.response.send_message("You do not have any saved keyword pingers yet.", ephemeral=True)
+        return
+
+    grouped: Dict[str, List[int]] = {}
+    for keyword, channel_id, _created_at in rows:
+        grouped.setdefault(keyword, []).append(int(channel_id))
+
+    lines = []
+    for keyword, channel_ids in grouped.items():
+        channel_mentions = ", ".join(f"<#{cid}>" for cid in sorted(set(channel_ids)))
+        lines.append(f"• `{keyword}` → {channel_mentions}")
+
+    msg = "Your saved keyword pingers:\n" + "\n".join(lines)
+    await interaction.response.send_message(msg[:1900], ephemeral=True)
+
+
+@keyword_group.command(name="remove", description="Remove one of your saved keyword pingers.")
+@app_commands.describe(
+    keyword="Keyword to remove",
+    channel="Optional: start typing to pick one approved channel"
+)
+@app_commands.autocomplete(channel=_keyword_channel_choices)
+async def keyword_remove(interaction: discord.Interaction, keyword: str, channel: Optional[str] = None):
+    normalized = normalize_keyword(keyword)
+    if not normalized:
+        await interaction.response.send_message("Please provide a valid keyword.", ephemeral=True)
+        return
+
+    selected_channel: Optional[discord.TextChannel] = None
+    if channel:
+        if not interaction.guild:
+            await interaction.response.send_message("This command can only be used inside the server.", ephemeral=True)
+            return
+        selected_channel = _resolve_keyword_channel(interaction.guild, channel)
+        if not selected_channel:
+            await interaction.response.send_message(
+                "Pick a channel from the approved autocomplete list only.",
+                ephemeral=True
+            )
+            return
+
+    deleted = remove_keyword_pinger(interaction.user.id, normalized, channel_id=(selected_channel.id if selected_channel else None))
+    if deleted <= 0:
+        if selected_channel:
+            await interaction.response.send_message(
+                f"No saved pinger found for `{normalized}` in {selected_channel.mention}.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"No saved pingers found for keyword `{normalized}`.",
+                ephemeral=True
+            )
+        return
+
+    if selected_channel:
+        await interaction.response.send_message(
+            f"Removed `{normalized}` from {selected_channel.mention}. ({deleted} subscription removed)",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"Removed keyword `{normalized}` from all your saved channels. ({deleted} subscriptions removed)",
+            ephemeral=True
+        )
+
+
+client.tree.add_command(keyword_group, guild=discord.Object(id=GUILD_ID))
+
+
+async def process_keyword_pingers(message: discord.Message):
+    if not message.guild or not isinstance(message.channel, discord.TextChannel):
+        return
+
+    text = (message.content or "").lower()
+    if not text:
+        return
+
+    subscriptions = get_keyword_pingers_for_channel(message.channel.id)
+    if not subscriptions:
+        return
+
+    matches_by_user: Dict[int, List[str]] = {}
+    for user_id, keyword in subscriptions:
+        if not keyword:
+            continue
+        if keyword in text:
+            matches_by_user.setdefault(int(user_id), []).append(keyword)
+
+    for user_id, matched_keywords in matches_by_user.items():
+        try:
+            user = client.get_user(user_id) or await client.fetch_user(user_id)
+            if not user:
+                continue
+
+            deduped = sorted(set(matched_keywords))
+            jump_link = message.jump_url
+            keyword_list = ", ".join(f"`{k}`" for k in deduped)
+            await user.send(
+                f"🔔 Your keyword alert matched in **#{message.channel.name}**.\n"
+                f"Keywords: {keyword_list}\n"
+                f"Author: {message.author.mention}\n"
+                f"Message: {jump_link}"
+            )
+        except Exception as e:
+            logger.error(f"Failed sending keyword alert DM to {user_id}: {e}")
+
+
 @client.event
 async def on_ready():
     logger.info(f'Logged in as {client.user}')
@@ -2681,6 +2984,12 @@ async def on_message(message: discord.Message):
     # Never react to our own bot messages
     if client.user and message.author.id == client.user.id:
         return
+
+    # Keyword pinger checks run for all text channels in the guild
+    try:
+        await process_keyword_pingers(message)
+    except Exception as e:
+        logger.error(f"Keyword pinger processing failed for message {message.id}: {e}")
 
     # Only care about the configured channels
     if message.channel.id not in AUTO_ROLE_PING_CHANNELS:
