@@ -343,15 +343,13 @@ def check_skipped_product(gtin):
 init_db()
 
 KEYWORD_ALLOWED_CHANNEL_IDS = {
+    1469846994641223784,
+    1469847414738387191,
+    1469847611451375780,
     1265414863384084490,
     1369779123949539458,
     1418877365005582367,
     1483178233095651539,
-    1265414756206903400,
-    1478084254687825980,
-    1469846994641223784,
-    1469847414738387191,
-    1469847611451375780,
 }
 
 KEYWORD_ALLOWED_CATEGORY_IDS = {
@@ -2711,50 +2709,6 @@ async def qogita(interaction: discord.Interaction, brand: str, max_price: float 
 keyword_group = app_commands.Group(name="keyword", description="Keyword alert commands")
 
 
-class KeywordChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self, parent_view: "KeywordChannelPickerView"):
-        super().__init__(
-            placeholder="Select one or more channels…",
-            min_values=1,
-            max_values=min(25, len(parent_view.allowed_channel_ids)),
-            channel_types=[ChannelType.text, ChannelType.news]
-        )
-        self.parent_view = parent_view
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.parent_view.owner_id:
-            await interaction.response.send_message("Only the command author can use this selector.", ephemeral=True)
-            return
-
-        picked_channels = [c.id for c in self.values if c.id in self.parent_view.allowed_channel_ids]
-        if not picked_channels:
-            await interaction.response.send_message("Please select at least one allowed channel.", ephemeral=True)
-            return
-
-        inserted = save_keyword_pinger(self.parent_view.owner_id, self.parent_view.keyword, picked_channels)
-        channel_mentions = ", ".join(f"<#{cid}>" for cid in picked_channels)
-        await interaction.response.edit_message(
-            content=(
-                f"Keyword alert saved for `{self.parent_view.keyword}` in {len(picked_channels)} channel(s): {channel_mentions}\n"
-                f"New subscriptions added: **{inserted}**"
-            ),
-            view=None
-        )
-        self.parent_view.stop()
-
-
-class KeywordChannelPickerView(View):
-    def __init__(self, owner_id: int, keyword: str, allowed_channel_ids: set[int]):
-        super().__init__(timeout=120)
-        self.owner_id = owner_id
-        self.keyword = keyword
-        self.allowed_channel_ids = allowed_channel_ids
-        self.add_item(KeywordChannelSelect(self))
-
-    async def on_timeout(self):
-        self.stop()
-
-
 def collect_allowed_keyword_channels(guild: discord.Guild) -> Dict[int, discord.abc.GuildChannel]:
     allowed_channels: Dict[int, discord.abc.GuildChannel] = {}
 
@@ -2775,8 +2729,11 @@ def collect_allowed_keyword_channels(guild: discord.Guild) -> Dict[int, discord.
 
 
 @keyword_group.command(name="pinger", description="Get DM alerts when your keyword appears.")
-@app_commands.describe(keyword="Word or phrase to watch for")
-async def keyword_pinger(interaction: discord.Interaction, keyword: str):
+@app_commands.describe(
+    keyword="Word or phrase to watch for",
+    channel="Channel to monitor for this keyword"
+)
+async def keyword_pinger(interaction: discord.Interaction, keyword: str, channel: discord.TextChannel):
     normalized = normalize_keyword(keyword)
     if not normalized:
         await interaction.response.send_message("Please provide a valid keyword.", ephemeral=True)
@@ -2791,12 +2748,24 @@ async def keyword_pinger(interaction: discord.Interaction, keyword: str):
         await interaction.response.send_message("No allowed channels are currently available.", ephemeral=True)
         return
 
-    view = KeywordChannelPickerView(interaction.user.id, normalized, set(allowed_channels.keys()))
-    await interaction.response.send_message(
-        f"Keyword: `{normalized}`\nSelect one or more channels to monitor.",
-        view=view,
-        ephemeral=True
-    )
+    if channel.id not in allowed_channels:
+        await interaction.response.send_message(
+            "That channel is not allowed for keyword pingers. Choose one from the approved channels/categories.",
+            ephemeral=True
+        )
+        return
+
+    inserted = save_keyword_pinger(interaction.user.id, normalized, [channel.id])
+    if inserted > 0:
+        await interaction.response.send_message(
+            f"Saved keyword `{normalized}` for {channel.mention}.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"You already have keyword `{normalized}` saved for {channel.mention}.",
+            ephemeral=True
+        )
 
 
 @keyword_group.command(name="list", description="See your saved keyword pingers.")
