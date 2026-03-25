@@ -2728,7 +2728,7 @@ def collect_allowed_keyword_channels(guild: discord.Guild) -> Dict[int, discord.
     return allowed_channels
 
 
-def _keyword_channel_choices(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+async def _keyword_channel_choices(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
     if not interaction.guild:
         return []
     allowed_channels = collect_allowed_keyword_channels(interaction.guild)
@@ -2746,16 +2746,37 @@ def _keyword_channel_choices(interaction: discord.Interaction, current: str) -> 
     return choices
 
 
-def _resolve_keyword_channel(guild: discord.Guild, channel_id_text: str) -> Optional[discord.TextChannel]:
+def _resolve_keyword_channel(guild: discord.Guild, channel_input: str) -> Optional[discord.TextChannel]:
+    allowed_channels = collect_allowed_keyword_channels(guild)
+    if not allowed_channels:
+        return None
+
+    raw = str(channel_input or "").strip()
+    if not raw:
+        return None
+
+    # Preferred path: autocomplete returns the channel ID as the option value.
+    channel_id_text = raw
+    if raw.startswith("<#") and raw.endswith(">"):
+        channel_id_text = raw[2:-1].strip()
+
     try:
         channel_id = int(channel_id_text)
     except (TypeError, ValueError):
-        return None
+        channel_id = None
 
-    allowed_channels = collect_allowed_keyword_channels(guild)
-    channel = allowed_channels.get(channel_id)
-    if isinstance(channel, discord.TextChannel):
-        return channel
+    if channel_id is not None:
+        channel = allowed_channels.get(channel_id)
+        if isinstance(channel, discord.TextChannel):
+            return channel
+
+    # Fallback: if the client sent a name instead of the choice value, match by name.
+    normalized = raw.lower().lstrip("#").strip()
+    if not normalized:
+        return None
+    for channel in allowed_channels.values():
+        if channel.name.lower() == normalized:
+            return channel
     return None
 
 
